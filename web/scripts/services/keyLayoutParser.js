@@ -19,6 +19,10 @@ export const STYLE_OVERRIDE_KEYS = [
 
 export const SCROLL_TYPES = new Set(["scroller", "scroll_updown", "scroll_up", "scroll_down"]);
 
+//wheel ticks as plain activators for a key element (any direction, up only, down only), eg "key_space|mouse_wheel"
+//unlike the scroll displays above they dont swap labels, show a tick counter or react to middle click
+export const WHEEL_KEY_TYPES = new Set(["mouse_wheel", "mouse_wheel_up", "mouse_wheel_down"]);
+
 export function normalizePipeType(type) {
     if (!type.includes("|")) return type;
     

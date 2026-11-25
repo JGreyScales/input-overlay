@@ -111,6 +111,11 @@ async fn handle_connection(
     status: Arc<Mutex<ServerStatus>>,
     notify: Arc<dyn Fn(&ServerStatus) + Send + Sync>,
 ) {
+    //every input is its own tiny frame.. with nagle on they wait for the clients (delayed) ack and mouse moves arrive in clumps
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!("couldn't set TCP_NODELAY for {addr}: {e}");
+    }
+
     let ws = match accept_async(stream).await {
         Ok(w) => w,
         Err(e) => {

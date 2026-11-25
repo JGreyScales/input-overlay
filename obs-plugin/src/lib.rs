@@ -18,6 +18,8 @@ static OBS_MODULE_PTR: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
 static PLUGIN_STATE: Mutex<Option<PluginState>> = Mutex::new(None);
 pub static INPUT_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<InputEvent>> = std::sync::OnceLock::new();
 pub const GAMEPAD_FLUSH_HZ: u32 = 64;
+//keyboard and mouse are read this often.. 64 gave a 60fps canvas one mouse sample per frame at best and less than that above 60
+pub const INPUT_FLUSH_HZ: u32 = 250;
 
 struct PluginState {
     _runtime: tokio::runtime::Runtime,
@@ -109,7 +111,7 @@ pub extern "C" fn obs_module_load() -> bool {
     let raw_input = Some(services::windows::raw_input::RawInputThread::start(
         input_tx.clone(),
         min_delta,
-        64,
+        INPUT_FLUSH_HZ,
         false,
     ));
 
@@ -119,7 +121,7 @@ pub extern "C" fn obs_module_load() -> bool {
         &kbd_dev,
         &mouse_dev,
         min_delta,
-        64,
+        INPUT_FLUSH_HZ,
     ));
 
     let analog = if !analog_kb.is_empty() {
@@ -191,7 +193,7 @@ pub fn restart_evdev(kbd_path: &str, mouse_path: &str, min_delta: i32) {
         kbd_path,
         mouse_path,
         min_delta,
-        64,
+        INPUT_FLUSH_HZ,
     ));
     
     tracing::info!("evdev: restarted with keyboard '{kbd_path}', mouse '{mouse_path}'");

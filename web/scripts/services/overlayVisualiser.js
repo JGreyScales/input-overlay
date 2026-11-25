@@ -1,3 +1,5 @@
+import { WHEEL_KEY_TYPES } from "./keyLayoutParser.js";
+
 const SCROLL_HISTORY_PULSE_MS = 80;
 
 export class OverlayVisualiser {
@@ -13,6 +15,9 @@ export class OverlayVisualiser {
         this.currentScrollCount = 0;
         this.lastScrollDirection = null;
         this.scrollTimeout = null;
+        this._elementKeys = new WeakMap();
+        this._wheelLit = new Map();
+        this._wheelKeyTimers = {};
 
         this.analogMode = false;
         this.analogTargetDepths = {};
@@ -39,7 +44,13 @@ export class OverlayVisualiser {
         this.MOUSEPAD_SHOW_DISTANCE = false;
         this.MOUSEPAD_DPI = 400;
         this.MOUSEPAD_RESET_DISTANCE_AFTER_FADE = false;
+        this.MOUSEPAD_RESET_DELAY = 200;
         this._mousePadTotalDistancePx = 0;
+        this._mousePadGhosts = [];
+        this._mousePadLastActive = -Infinity;
+        this._mousePadBurstStart = -Infinity;
+        this._mousePadBurstX = 0;
+        this._mousePadBurstY = 0;
         this.MOUSEPAD_PAN_X = 0;
         this.MOUSEPAD_PAN_Y = 0;
         this._mousePadRafLoop = this._mousePadRafLoop.bind(this);
@@ -128,6 +139,10 @@ export class OverlayVisualiser {
                 activeSet.delete(keyName);
                 this.noteInput(keyName, false);
             }
+
+            //a wheel tick that is still showing keeps the element lit after one of its keys is released
+            const wheelName = this._wheelLit.get(el);
+            if (wheelName && wheelName !== keyName) this.updateElementState(el, wheelName, true, this.activeMouseButtons);
         }
     }
 
@@ -164,6 +179,46 @@ export class OverlayVisualiser {
             else state.log.push({ key: keyName, start: now, end: now + SCROLL_HISTORY_PULSE_MS });
             if (!state.rafId) state.rafId = requestAnimationFrame(this._historyRafLoops[state.historyId]);
         }
+    }
+
+    //wheel ticks have no release, so elements bound to the wheel stay lit for the same hold time the scroll displays use
+    pulseWheelKeys(dir) {
+        const map = this.previewElements?.mouseElements;
+        if (!dir || !map) return;
+
+        for (const name of ["mouse_wheel", dir < 0 ? "mouse_wheel_up" : "mouse_wheel_down"]) {
+            const elements = map.get(name);
+            if (!elements?.length) continue;
+
+            for (const el of elements) {
+                this._wheelLit.set(el, name);
+                this.updateElementState(el, name, true, this.activeMouseButtons);
+            }
+
+            clearTimeout(this._wheelKeyTimers[name]);
+            this._wheelKeyTimers[name] = setTimeout(() => this._releaseWheelKey(name), this.scrollHoldMs || 250);
+        }
+    }
+
+    _releaseWheelKey(name) {
+        delete this._wheelKeyTimers[name];
+        const isHeld = (k) => this.activeKeys.has(k) || this.activeMouseButtons.has(k) || this.activeGamepadButtons.has(k);
+
+        for (const [el, litBy] of [...this._wheelLit]) {
+            if (litBy !== name) continue;
+            this._wheelLit.delete(el);
+            //another key of the same element that is still down keeps it lit
+            const keyStillDown = (this._elementKeys.get(el) ?? []).some(k => !WHEEL_KEY_TYPES.has(k) && isHeld(k));
+            if (!keyStillDown) this.updateElementState(el, name, false, this.activeMouseButtons);
+        }
+        this.activeMouseButtons.delete(name);
+    }
+
+    clearWheelKeys() {
+        for (const timer of Object.values(this._wheelKeyTimers)) clearTimeout(timer);
+        this._wheelKeyTimers = {};
+        this._wheelLit.clear();
+        for (const name of WHEEL_KEY_TYPES) this.activeMouseButtons.delete(name);
     }
 
     releaseHeldInputs() {
@@ -234,6 +289,9 @@ export class OverlayVisualiser {
         this.MOUSEPAD_SHOW_DISTANCE = opts.mouse_show_distance === true || opts.mouse_show_distance === "true" || opts.mouse_show_distance === "1";
         this.MOUSEPAD_DPI = parseInt(opts.mouse_distance_dpi) || 400;
         this.MOUSEPAD_RESET_DISTANCE_AFTER_FADE = opts.mouse_reset_distance_after_fade === true || opts.mouse_reset_distance_after_fade === "true" || opts.mouse_reset_distance_after_fade === "1";
+        const resetDelay = parseInt(opts.mouse_reset_delay);
+        this.MOUSEPAD_RESET_DELAY = Number.isFinite(resetDelay) ? Math.max(0, resetDelay) : 200;
+        if (this.MOUSEPAD_MODE === "pan") this._mousePadGhosts = [];
 
         const newTextureUrl = opts.mouse_pad_texture_url || "";
         const newTextureZoom = parseFloat(opts.mouse_pad_texture_zoom) || 1;
@@ -519,6 +577,7 @@ export class OverlayVisualiser {
         const scrollDisplays = [], scrollArrows = [], scrollCounts = [];
 
         this.scrollerAliases.clear();
+        this.clearWheelKeys();
 
         for (const state of Object.values(this._historyCanvases)) {
             if (state.rafId) cancelAnimationFrame(state.rafId);
@@ -655,6 +714,7 @@ export class OverlayVisualiser {
                 default: {
                     const keys = item.keys ?? (item.type.includes("|") ? item.type.split("|") : [item.type]);
                     const el = this.createKeyOrButtonElement({ ...item, key: keys[0], class: overrideClass });
+                    this._elementKeys.set(el, keys);
                     el.style.position = "absolute";
                     el.style.left = `${x}px`;
                     el.style.top = `${y}px`;
@@ -719,6 +779,7 @@ export class OverlayVisualiser {
         this.mousePadCanvas = canvas;
         this.mousePadCtx = canvas.getContext("2d");
         this.mousePadTrail = [];
+        this._mousePadGhosts = [];
         this.mousePadCursorX = null;
         this.mousePadCursorY = null;
 
@@ -1089,6 +1150,39 @@ export class OverlayVisualiser {
         this.mousePadCursorX = logicalW / 2;
         this.mousePadCursorY = logicalH / 2;
         this.mousePadTrail = [];
+        this._mousePadGhosts = [];
+    }
+
+    //idle reset for wrap mode: once the mouse has been still for mouse_reset_delay ms the next stroke starts from the middle again
+    //returns the movement to apply, or null while its only the stray counts of a resting hand
+    _mousePadIdleGate(dx, dy, W, H) {
+        const delay = this.MOUSEPAD_RESET_DELAY;
+        if (!(delay > 0) || this.MOUSEPAD_MODE === "pan") return [dx, dy];
+
+        const now = performance.now();
+        if (now - this._mousePadBurstStart > delay) {
+            this._mousePadBurstStart = now;
+            this._mousePadBurstX = 0;
+            this._mousePadBurstY = 0;
+        }
+        //net travel in this window.. jitter cancels itself out, real movement adds up
+        this._mousePadBurstX += dx;
+        this._mousePadBurstY += dy;
+
+        const idle = now - this._mousePadLastActive >= delay;
+        //about a quarter of a millimeter at the configured dpi
+        const noise = Math.max(3, (this.MOUSEPAD_DPI || 400) * 0.01);
+        if (Math.abs(this._mousePadBurstX) + Math.abs(this._mousePadBurstY) < noise) return idle ? null : [dx, dy];
+
+        this._mousePadLastActive = now;
+        if (!idle) return [dx, dy];
+
+        //the old stroke stays where it ended and fades out on its own, the new one starts in the middle
+        if (this.mousePadTrail.length) this._mousePadGhosts.push(this.mousePadTrail);
+        this.mousePadCursorX = W / 2;
+        this.mousePadCursorY = H / 2;
+        this.mousePadTrail = [{ x: W / 2, y: H / 2, t: now, m1: false, d: 0 }];
+        return [this._mousePadBurstX, this._mousePadBurstY];
     }
 
     handleMouseMove(dx, dy) {
@@ -1096,6 +1190,10 @@ export class OverlayVisualiser {
         const W = parseFloat(this.mousePadCanvas.dataset.logicalW) || 0;
         const H = parseFloat(this.mousePadCanvas.dataset.logicalH) || 0;
         if (!W || !H) return;
+
+        const moved = this._mousePadIdleGate(dx, dy, W, H);
+        if (!moved) return;
+        [dx, dy] = moved;
 
         if (this.mousePadCursorX === null) {
             this.mousePadCursorX = W / 2;
@@ -1427,14 +1525,32 @@ export class OverlayVisualiser {
             else drawSmoothedRun(pts, idleFade);
 
         } else {
-            let run = [];
-            for (let i = 0; i < trail.length; i++) {
-                const p = trail[i];
-                if (p === null) { if (run.length > 1) drawSmoothedRun(run, idleFade, false); run = []; }
-                else run.push(p);
-            }
-            if (run.length === 1) drawTip(run[0], idleFade);
-            else drawSmoothedRun(run, idleFade);
+            const drawWrapTrail = (points, fade) => {
+                let run = [];
+                for (let i = 0; i < points.length; i++) {
+                    const p = points[i];
+                    if (p === null) { if (run.length > 1) drawSmoothedRun(run, fade, false); run = []; }
+                    else run.push(p);
+                }
+                if (run.length === 1) drawTip(run[0], fade);
+                else drawSmoothedRun(run, fade);
+            };
+
+            //strokes left behind by an idle reset keep fading where they ended
+            if (noFadeout) this._mousePadGhosts = [];
+            const ghostCutoff = now - maxAge;
+            this._mousePadGhosts = this._mousePadGhosts.filter(ghost => {
+                let stale = 0;
+                while (stale < ghost.length && (ghost[stale] === null || ghost[stale].t < ghostCutoff)) stale++;
+                if (stale > 0) ghost.splice(0, stale);
+                let last = null;
+                for (let i = ghost.length - 1; i >= 0; i--) { if (ghost[i] !== null) { last = ghost[i]; break; } }
+                if (!last) return false;
+                drawWrapTrail(ghost, Math.max(0, 1 - (now - last.t) / maxAge));
+                return true;
+            });
+
+            drawWrapTrail(trail, idleFade);
         }
 
         ctx.restore();
@@ -1481,7 +1597,7 @@ export class OverlayVisualiser {
         }
         this._mousePadWasLiveTrail = trailVisuallyLive;
 
-        if (hasLiveTrail || this._mousePadTextureAnimated)
+        if (hasLiveTrail || this._mousePadTextureAnimated || this._mousePadGhosts.length)
             this.mousePadRafId = requestAnimationFrame(this._mousePadRafLoop);
     }
 

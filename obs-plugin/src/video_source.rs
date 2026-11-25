@@ -430,6 +430,47 @@ fn send_command(cmd_tx: &Option<std::sync::mpsc::Sender<RenderCommand>>, cmd: Re
     }
 }
 
+//frame pacing for the render worker.. intervals run from frame start to frame start
+//timing them from the end of a draw put the draw time on top of every interval, so the overlay never reached its cap
+struct FramePacer {
+    last_start: Option<Instant>,
+    pending: bool,
+}
+
+impl FramePacer {
+    fn new() -> Self {
+        FramePacer {
+            last_start: None,
+            pending: false,
+        }
+    }
+
+    //true when a frame should start now.. one that is wanted too early stays pending instead of being dropped
+    fn should_draw(&mut self, wanted: bool, interval: Duration, now: Instant) -> bool {
+        if !wanted && !self.pending {
+            return false;
+        }
+        let too_soon = self
+            .last_start
+            .is_some_and(|last| now.saturating_duration_since(last) < interval);
+        self.pending = too_soon;
+        if !too_soon {
+            self.last_start = Some(now);
+        }
+        !too_soon
+    }
+
+    //how long the worker may sleep without running past the start of a pending frame
+    fn sleep_for(&self, interval: Duration, now: Instant) -> Duration {
+        match (self.pending, self.last_start) {
+            (true, Some(last)) => interval
+                .saturating_sub(now.saturating_duration_since(last))
+                .min(RENDER_POLL_INTERVAL),
+            _ => RENDER_POLL_INTERVAL,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_render_worker(
     mut event_rx: Option<broadcast::Receiver<InputEvent>>,
@@ -450,8 +491,7 @@ fn spawn_render_worker(
             let mut width = initial_width;
             let mut height = initial_height;
             let mut caps = FpsCaps::default();
-            let mut last_draw: Option<Instant> = None;
-            let mut pending = false;
+            let mut pacer = FramePacer::new();
 
             loop {
                 let mut shutdown = false;
@@ -517,13 +557,8 @@ fn spawn_render_worker(
                 
                 let min_frame_time = frame_interval(caps.overlay, canvas);
 
-                changed = changed || pending || renderer.as_ref().is_some_and(|r| r.needs_constant_redraw());
-                
-                if changed {
-                    let too_soon = last_draw.is_some_and(|last| last.elapsed() < min_frame_time);
-                    pending = too_soon;
-                    changed = !too_soon;
-                }
+                changed = changed || renderer.as_ref().is_some_and(|r| r.needs_constant_redraw());
+                changed = pacer.should_draw(changed, min_frame_time, Instant::now());
 
                 #[cfg(feature = "profiler")]
                 profiler.mark("POLL");
@@ -547,12 +582,11 @@ fn spawn_render_worker(
                                 height,
                                 pixmap,
                             });
-                            last_draw = Some(Instant::now());
                         }
                     }
                 }
 
-                std::thread::sleep(RENDER_POLL_INTERVAL);
+                std::thread::sleep(pacer.sleep_for(min_frame_time, Instant::now()));
             }
         })
         .ok()
@@ -915,4 +949,63 @@ fn parse_resolution(s: &str) -> (u32, u32) {
         }
     }
     (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    //runs the worker loop on a made up clock: every frame takes `draw` to render
+    fn frame_starts(interval: Duration, draw: Duration, run_for: Duration) -> Vec<Duration> {
+        let t0 = Instant::now();
+        let mut now = t0;
+        let mut pacer = FramePacer::new();
+        let mut starts = Vec::new();
+        while now.duration_since(t0) < run_for {
+            if pacer.should_draw(true, interval, now) {
+                starts.push(now.duration_since(t0));
+                now += draw;
+            }
+            now += pacer.sleep_for(interval, now);
+        }
+        starts
+    }
+
+    #[test]
+    fn slow_draws_dont_stretch_the_frame_interval() {
+        let interval = frame_interval(0, 60.0);
+        //a draw that eats most of the interval used to drop a 60fps canvas to ~40fps
+        for draw_ms in [1, 6, 10, 14] {
+            let starts = frame_starts(interval, Duration::from_millis(draw_ms), Duration::from_secs(1));
+            assert!(starts.len() >= 60, "{draw_ms}ms draws: only {} frames in a second", starts.len());
+            for pair in starts.windows(2) {
+                let gap = pair[1] - pair[0];
+                assert!(gap >= interval, "{draw_ms}ms draws: frames {gap:?} apart, cap is {interval:?}");
+                assert!(gap <= interval + RENDER_POLL_INTERVAL, "{draw_ms}ms draws: frames {gap:?} apart");
+            }
+        }
+    }
+
+    #[test]
+    fn draws_slower_than_the_interval_run_back_to_back() {
+        let interval = frame_interval(0, 60.0);
+        let draw = Duration::from_millis(25);
+        let starts = frame_starts(interval, draw, Duration::from_secs(1));
+        for pair in starts.windows(2) {
+            assert!(pair[1] - pair[0] <= draw + RENDER_POLL_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn a_frame_wanted_too_early_is_kept_for_later() {
+        let interval = Duration::from_millis(15);
+        let t0 = Instant::now();
+        let mut pacer = FramePacer::new();
+        assert!(pacer.should_draw(true, interval, t0));
+        assert!(!pacer.should_draw(true, interval, t0 + Duration::from_millis(5)));
+        //nothing new happened since, the frame from 5ms is still owed
+        assert!(!pacer.should_draw(false, interval, t0 + Duration::from_millis(10)));
+        assert!(pacer.should_draw(false, interval, t0 + Duration::from_millis(15)));
+        assert!(!pacer.should_draw(false, interval, t0 + Duration::from_millis(40)));
+    }
 }

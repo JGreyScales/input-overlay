@@ -1,6 +1,6 @@
 //guh
 import { KEY_CODES, MOUSE_CODES, COLOR_PICKERS, LOCAL_INSTANCE } from "../consts.js";
-import { STYLE_OVERRIDE_KEYS, SCROLL_TYPES, normalizePipeType } from "./keyLayoutParser.js";
+import { STYLE_OVERRIDE_KEYS, SCROLL_TYPES, WHEEL_KEY_TYPES, normalizePipeType } from "./keyLayoutParser.js";
 import { LEGACY_TO_CURRENT } from "./settingsFieldMap.js";
 import { GamepadManager } from "./gamepadManager.js";
 
@@ -72,6 +72,12 @@ const ELEMENT_CATALOG = [
                 ]
             },
             {
+                //plain activators: pick one together with a key (eg Space) to light that key on wheel ticks too
+                label: "wheel as key", tiles: [
+                    ["mouse_wheel", "wheel ↕"], ["mouse_wheel_up", "wheel ↑"], ["mouse_wheel_down", "wheel ↓"],
+                ]
+            },
+            {
                 label: "pad", tiles: [
                     ["mouse_pad", "mouse pad", 3]
                 ]
@@ -104,8 +110,8 @@ const isGamepadButton = (type) => type.startsWith("gp_") && !type.startsWith("gp
 const KEY_PICKER_SCOPES = {
     //input history logs anything with a press, scroll ticks become short presses
     history: (t) => t.startsWith("key_") || MOUSE_BUTTON_TYPES.has(t) || t === "scroll_up" || t === "scroll_down" || isGamepadButton(t),
-    //regular elements bind keys, mouse buttons and gamepad buttons
-    binding: (t) => t.startsWith("key_") || MOUSE_BUTTON_TYPES.has(t) || isGamepadButton(t),
+    //regular elements bind keys, mouse buttons, wheel ticks and gamepad buttons
+    binding: (t) => t.startsWith("key_") || MOUSE_BUTTON_TYPES.has(t) || WHEEL_KEY_TYPES.has(t) || isGamepadButton(t),
     //scroller aliases are only registered for keys and mouse buttons
     alias: (t) => t.startsWith("key_") || MOUSE_BUTTON_TYPES.has(t),
 };
@@ -475,6 +481,7 @@ export class ConfiguratorMode {
             mouse_show_distance: true,
             mouse_distance_dpi: "400",
             mouse_reset_distance_after_fade: false,
+            mouse_reset_delay: "200",
         });
         if (this.keyLayoutParser) {
             this.keyLayoutMode = true;
@@ -528,6 +535,7 @@ export class ConfiguratorMode {
             mouse_show_distance: chk("mouse_show_distance"),
             mouse_distance_dpi: val("mouse_distance_dpi") || "400",
             mouse_reset_distance_after_fade: chk("mouse_reset_distance_after_fade"),
+            mouse_reset_delay: val("mouse_reset_delay") !== "" ? val("mouse_reset_delay") : "200",
             keyLayout: this._getKeyLayoutParam(),
         };
     }
@@ -580,6 +588,9 @@ export class ConfiguratorMode {
         }
         if (id === "mouse_trail_fade_duration") {
             label.textContent = input.value + "ms"; return;
+        }
+        if (id === "mouse_reset_delay") {
+            label.textContent = input.value === "0" ? "off" : input.value + "ms"; return;
         }
         if (id === "mouse_trail_length") {
             label.textContent = input.value + "pts"; return;
@@ -659,6 +670,7 @@ export class ConfiguratorMode {
         applyValue("mouse_show_distance", settings.mouse_show_distance ?? false);
         applyValue("mouse_distance_dpi", settings.mouse_distance_dpi ?? "400");
         applyValue("mouse_reset_distance_after_fade", settings.mouse_reset_distance_after_fade ?? false);
+        applyValue("mouse_reset_delay", settings.mouse_reset_delay ?? "200");
     }
 
     updateState(settings = null) {
@@ -1041,6 +1053,7 @@ export class ConfiguratorMode {
             }
         } else if (type === "mouse_wheel") {
             this.visualizer.noteScroll(Math.sign(event.deltaY));
+            this.visualizer.pulseWheelKeys(Math.sign(event.deltaY));
             if (els.scrollDisplays?.length) this.visualizer.handleScroll(Math.sign(event.deltaY));
         } else if (type === "mouse_moved") {
             if (this.visualizer.mousePadCanvas)

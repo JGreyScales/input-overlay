@@ -140,6 +140,9 @@ export class UrlManager {
         if (settings.mouse_reset_distance_after_fade === true || settings.mouse_reset_distance_after_fade === "true" || settings.mouse_reset_distance_after_fade === "1") {
             params.push("mouse_reset_distance_after_fade=1");
         }
+        if (settings.mouse_reset_delay != null && String(settings.mouse_reset_delay) !== "200") {
+            addParam("mouse_reset_delay", settings.mouse_reset_delay);
+        }
 
         if (settings.keyLayout) {
             params.push(`keyLayout=${settings.keyLayout}`);
@@ -179,6 +182,7 @@ export class UrlManager {
             mouse_show_distance: get("mouse_show_distance") === "1",
             mouse_distance_dpi: get("mouse_distance_dpi") || "400",
             mouse_reset_distance_after_fade: get("mouse_reset_distance_after_fade") === "1",
+            mouse_reset_delay: get("mouse_reset_delay") ?? "200",
             key_gap_scale: get("key_gap_scale") || "100",
             key_outline_width_pressed: get("key_outline_width_pressed") || "2",
             key_outline_width_idle: get("key_outline_width_idle") || "2",

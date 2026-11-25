@@ -141,10 +141,11 @@ impl HistoryState {
             });
         
         if !reuse {
+            let rendered_at = Instant::now();
             let Some(content) = self.render_content(buf_w, buf_h, scale, params) else {
                 return;
             };
-            self.cache = Some((content, Instant::now()));
+            self.cache = Some((content, rendered_at));
             self.dirty = false;
         }
         

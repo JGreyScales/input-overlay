@@ -37,6 +37,7 @@ pub struct OverlaySettings {
     pub mouse_show_distance: bool,
     pub mouse_distance_dpi: f64,
     pub mouse_reset_distance_after_fade: bool,
+    pub mouse_reset_delay: f64,
     pub key_gap_scale: f64,
     pub key_outline_width_pressed: f64,
     pub key_outline_width_idle: f64,
@@ -218,6 +219,7 @@ const SETTING_KEYS: &[&str] = &[
     "mouse_show_distance",
     "mouse_distance_dpi",
     "mouse_reset_distance_after_fade",
+    "mouse_reset_delay",
     "key_gap_scale",
     "key_outline_width_pressed",
     "key_outline_width_idle",
@@ -623,6 +625,7 @@ pub fn parse_overlay_settings(p: &HashMap<String, String>) -> OverlaySettings {
         mouse_show_distance: get_bool(p, "mouse_show_distance"),
         mouse_distance_dpi: get_f64(p, "mouse_distance_dpi", 400.0),
         mouse_reset_distance_after_fade: get_bool(p, "mouse_reset_distance_after_fade"),
+        mouse_reset_delay: get_f64(p, "mouse_reset_delay", 200.0),
         key_gap_scale: get_f64(p, "key_gap_scale", 100.0),
         key_outline_width_pressed: get_f64(p, "key_outline_width_pressed", 2.0),
         key_outline_width_idle: get_f64(p, "key_outline_width_idle", 2.0),
@@ -631,5 +634,63 @@ pub fn parse_overlay_settings(p: &HashMap<String, String>) -> OverlaySettings {
         analog_legend_fill_mode: get_str(p, "analog_legend_fill_mode", "fading"),
         analog_force_disable: get_bool(p, "analog_force_disable"),
         gamepad_deadzone: get_f64(p, "gamepad_deadzone", 3.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    //same container as the configurators share links: ?cfg=<base64url(zlib(settings query))>
+    fn link(query: &str) -> String {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(query.as_bytes()).unwrap();
+        let cfg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoder.finish().unwrap());
+        format!("https://overlay.girlglock.com/?cfg={cfg}")
+    }
+
+    const LAYOUT: &str = concat!(
+        r#"[{"type":"key_space","w":3.25,"h":1,"x":162.5,"y":168.75,"label":"SPACE"},"#,
+        r#"{"type":"mouse_pad","w":5,"h":3.63,"x":331.25,"y":37.5},"#,
+        r#"{"type":"scroller","w":1.5,"h":0.63,"x":418.75,"y":0,"labels":["-","🡅","🡇"]}]"#,
+    );
+
+    #[test]
+    fn links_made_before_the_new_settings_still_load() {
+        let decoded = decode_link(&link(&format!(
+            "key_glow_color=5cf67d&key_animation_speed=300&mouse_trail_sensitivity=101&mouse_show_distance=1&keyLayout={LAYOUT}"
+        )));
+        assert_eq!(decoded.layout.len(), 3);
+        assert_eq!(decoded.layout[0].type_, "key_space");
+        assert_eq!(decoded.layout[0].label.as_deref(), Some("SPACE"));
+        assert!(decoded.layout[0].keys.is_empty());
+        assert_eq!(decoded.layout[2].labels, ["-", "🡅", "🡇"]);
+        assert_eq!(decoded.settings.key_glow_color, "#5cf67d");
+        assert_eq!(decoded.settings.mouse_trail_sensitivity, 101.0);
+        //not in the link: recenter after 200ms
+        assert_eq!(decoded.settings.mouse_reset_delay, 200.0);
+    }
+
+    #[test]
+    fn reset_delay_is_read_and_zero_turns_it_off() {
+        let delay = |query: &str| decode_link(&link(query)).settings.mouse_reset_delay;
+        assert_eq!(delay("mouse_reset_delay=350"), 350.0);
+        assert_eq!(delay("mouse_reset_delay=0"), 0.0);
+
+        let json = decode_json_config(r#"{"mouse_reset_delay":"75","keyLayout":[]}"#).unwrap();
+        assert_eq!(json.settings.mouse_reset_delay, 75.0);
+    }
+
+    #[test]
+    fn a_key_can_list_the_wheel_as_a_second_activator() {
+        let layout = LAYOUT.replace(r#""type":"key_space""#, r#""type":"key_space|mouse_wheel""#);
+        let decoded = decode_link(&link(&format!("keyLayout={layout}")));
+        let space = &decoded.layout[0];
+        //still a key with its own label, not turned into a scroll display
+        assert_eq!(space.type_, "key_space|mouse_wheel");
+        assert_eq!(space.keys, ["key_space", "mouse_wheel"]);
+        assert_eq!(space.label.as_deref(), Some("SPACE"));
+        assert!(space.labels.is_empty());
     }
 }

@@ -68,6 +68,17 @@ pub fn frame_interval(cap: u32, canvas_fps: f64) -> Duration {
         .max(Duration::from_millis(1))
 }
 
+//the mouse pad and input history only keep their own timer when capped below the overlay
+//uncapped they redraw with every overlay frame.. a second timer of the same length drifts against the first and skips frames
+fn element_interval(cap: u32, overlay_cap: u32, canvas_fps: f64) -> Duration {
+    let own = frame_interval(cap, canvas_fps);
+    if cap == 0 || own <= frame_interval(overlay_cap, canvas_fps) {
+        Duration::ZERO
+    } else {
+        own
+    }
+}
+
 struct PositionedElement {
     def: LayoutElementDef,
     rect: Rect,
@@ -92,6 +103,9 @@ const GAMEPAD_BUTTONS: [&str; 17] = [
 fn is_gamepad_trigger(name: &str) -> bool {
     name == "gp_lt" || name == "gp_rt"
 }
+
+//wheel ticks as plain activators for a key element: any direction, up only, down only.. keyLayoutParser.js WHEEL_KEY_TYPES
+const WHEEL_KEYS: [&str; 3] = ["mouse_wheel", "mouse_wheel_up", "mouse_wheel_down"];
 
 pub fn fetch_media(url: &str) -> Option<Vec<u8>> {
     texture::fetch_media(url)
@@ -125,6 +139,8 @@ pub struct Renderer {
     scroll: ScrollState,
     scroll_hold_ms: f32,
     hide_scroll_count: bool,
+    wheel_keys_bound: [bool; 3],
+    wheel_until: [Option<Instant>; 3],
     custom_font: Option<Font>,
     custom_font_real_bold: bool,
     font_rx: Option<Receiver<Option<LoadedFont>>>,
@@ -224,6 +240,7 @@ impl Renderer {
             texture_url: settings.mouse_pad_texture_url.clone(),
             texture_zoom: settings.mouse_pad_texture_zoom as f32,
             texture_opacity: settings.mouse_pad_texture_opacity as f32,
+            reset_delay_ms: settings.mouse_reset_delay as f32,
         };
 
         let mut mouse_pad = None;
@@ -296,6 +313,12 @@ impl Renderer {
             .map(|el| merge_style_override(&style, el.def.style_override.as_ref()))
             .collect();
 
+        let wheel_keys_bound = WHEEL_KEYS.map(|wheel| {
+            elements
+                .iter()
+                .any(|el| el.def.type_ == wheel || el.def.keys.iter().any(|k| k == wheel))
+        });
+
         let has_overlap = compute_overlaps(&elements);
         let key_transitions = elements.iter().map(|_| Transition::new()).collect();
         let scroll_transitions = scroll_displays.iter().map(|_| Transition::new()).collect();
@@ -348,6 +371,8 @@ impl Renderer {
             scroll: ScrollState::new(),
             scroll_hold_ms: 250.0 * (100.0 / (settings.key_animation_speed as f32).max(1.0)), //overlayVisualiser.js:163
             hide_scroll_count: settings.scroll_hide_combo,
+            wheel_keys_bound,
+            wheel_until: [None; 3],
             custom_font: None,
             custom_font_real_bold: false,
             font_rx,
@@ -403,6 +428,8 @@ impl Renderer {
                         changed = true;
                     }
                 }
+
+                changed |= self.pulse_wheel_keys(*rotation);
                 
                 if self.scroll_displays.is_empty() {
                     return changed;
@@ -461,15 +488,40 @@ impl Renderer {
     pub fn set_frame_intervals(&mut self, caps: FpsCaps, canvas_fps: f64) {
         if let Some((pad, _)) = self.mouse_pad.as_mut() {
             pad.set_frame_intervals(
-                frame_interval(caps.pad_background, canvas_fps),
-                frame_interval(caps.pad_trail, canvas_fps),
+                element_interval(caps.pad_background, caps.overlay, canvas_fps),
+                element_interval(caps.pad_trail, caps.overlay, canvas_fps),
             );
         }
         
-        let history = frame_interval(caps.history, canvas_fps);
+        let history = element_interval(caps.history, caps.overlay, canvas_fps);
         
         for (h, _) in self.histories.iter_mut() {
             h.set_frame_interval(history);
+        }
+    }
+
+    //wheel ticks have no release, so elements bound to the wheel stay lit for the same hold time the scroll displays use
+    fn pulse_wheel_keys(&mut self, rotation: i8) -> bool {
+        let until = Instant::now() + Duration::from_secs_f32(self.scroll_hold_ms.max(0.0) / 1000.0);
+        let direction = if rotation < 0 { 1 } else { 2 };
+        let mut changed = false;
+        for idx in [0, direction] {
+            if self.wheel_keys_bound[idx] {
+                self.wheel_until[idx] = Some(until);
+                self.active.insert(WHEEL_KEYS[idx].to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn expire_wheel_keys(&mut self) {
+        let now = Instant::now();
+        for (idx, until) in self.wheel_until.iter_mut().enumerate() {
+            if until.is_some_and(|t| now >= t) {
+                *until = None;
+                self.active.remove(WHEEL_KEYS[idx]);
+            }
         }
     }
 
@@ -485,6 +537,7 @@ impl Renderer {
         mouse_pad_live
             || history_live
             || self.scroll.is_live()
+            || self.wheel_until.iter().any(Option::is_some)
             || self.font_rx.is_some()
             || self.label_images.any_loading()
             || transitions_live
@@ -518,6 +571,7 @@ impl Renderer {
 
         self.poll_font();
         self.label_images.poll();
+        self.expire_wheel_keys();
         
         let primary_font = match &self.custom_font {
             Some(font) => Some((font, self.custom_font_real_bold)),
@@ -875,4 +929,111 @@ fn fit_rect(rect: &Rect, scale: f32, tx: f32, ty: f32) -> Rect {
         rect.height() * scale,
     )
     .unwrap_or(*rect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overlay_link::{default_settings, parse_layout_element};
+
+    fn element(json: &str) -> LayoutElementDef {
+        parse_layout_element(&serde_json::from_str(json).unwrap()).unwrap()
+    }
+
+    fn lit(renderer: &Renderer, idx: usize) -> bool {
+        renderer.is_active(&renderer.elements[idx])
+    }
+
+    fn wheel(rotation: i8) -> InputEvent {
+        InputEvent::MouseScroll { rotation, timestamp: 0 }
+    }
+
+    fn key(rawcode: u16, pressed: bool) -> InputEvent {
+        if pressed {
+            InputEvent::KeyPress { rawcode, timestamp: 0 }
+        } else {
+            InputEvent::KeyRelease { rawcode, timestamp: 0 }
+        }
+    }
+
+    const SPACE: u16 = 32;
+
+    fn hold_time(renderer: &Renderer) -> Duration {
+        Duration::from_secs_f32(renderer.scroll_hold_ms / 1000.0) + Duration::from_millis(20)
+    }
+
+    #[test]
+    fn a_key_bound_to_the_wheel_lights_up_on_ticks() {
+        let layout = [
+            element(r#"{"type":"key_space|mouse_wheel","label":"SPACE","w":3.25}"#),
+            element(r#"{"type":"key_w","label":"W"}"#),
+        ];
+        let mut r = Renderer::new(&layout, &default_settings());
+        assert_eq!(r.elements[0].def.label.as_deref(), Some("SPACE"));
+        assert!(matches!(r.element_order[0], ElementKind::Key));
+        assert!(!lit(&r, 0));
+
+        for rotation in [-1, 1] {
+            assert!(r.apply_event(&wheel(rotation)));
+            assert!(lit(&r, 0));
+            assert!(!lit(&r, 1));
+            //a tick has no release, the renderer has to come back and switch it off
+            assert!(r.needs_constant_redraw());
+            std::thread::sleep(hold_time(&r));
+            r.expire_wheel_keys();
+            assert!(!lit(&r, 0));
+        }
+
+        //the space bar still works and the middle button is not part of it
+        r.apply_event(&InputEvent::MouseButton { button: 3, pressed: true, timestamp: 0 });
+        assert!(!lit(&r, 0));
+        r.apply_event(&key(SPACE, true));
+        assert!(lit(&r, 0));
+
+        //a tick that runs out while space is held leaves the key lit
+        r.apply_event(&wheel(-1));
+        std::thread::sleep(hold_time(&r));
+        r.expire_wheel_keys();
+        assert!(lit(&r, 0));
+        r.apply_event(&key(SPACE, false));
+        assert!(!lit(&r, 0));
+    }
+
+    #[test]
+    fn wheel_direction_is_respected() {
+        let layout = [
+            element(r#"{"type":"key_space|mouse_wheel_down","label":"SPACE"}"#),
+            element(r#"{"type":"mouse_wheel_up","label":"UP"}"#),
+        ];
+        let mut r = Renderer::new(&layout, &default_settings());
+        r.apply_event(&wheel(-1));
+        assert!(!lit(&r, 0));
+        assert!(lit(&r, 1));
+        std::thread::sleep(hold_time(&r));
+        r.expire_wheel_keys();
+        r.apply_event(&wheel(1));
+        assert!(lit(&r, 0));
+        assert!(!lit(&r, 1));
+    }
+
+    #[test]
+    fn wheel_ticks_cost_nothing_when_no_key_uses_them() {
+        let layout = [element(r#"{"type":"key_space","label":"SPACE"}"#)];
+        let mut r = Renderer::new(&layout, &default_settings());
+        assert!(!r.apply_event(&wheel(-1)));
+        assert!(!lit(&r, 0));
+        assert!(r.active.is_empty());
+    }
+
+    #[test]
+    fn uncapped_elements_follow_the_overlay_frame_timer() {
+        //0 = no cap of its own, and a cap at or above the overlays is no cap either
+        assert_eq!(element_interval(0, 0, 60.0), Duration::ZERO);
+        assert_eq!(element_interval(60, 0, 60.0), Duration::ZERO);
+        assert_eq!(element_interval(240, 0, 60.0), Duration::ZERO);
+        assert_eq!(element_interval(30, 30, 60.0), Duration::ZERO);
+        //a real cap below the overlay keeps its own interval
+        assert_eq!(element_interval(30, 0, 60.0), frame_interval(30, 60.0));
+        assert_eq!(element_interval(10, 30, 60.0), frame_interval(10, 60.0));
+    }
 }

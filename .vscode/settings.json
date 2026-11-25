@@ -5,5 +5,6 @@
   "rust-analyzer.cargo.buildScripts.enable": true,
   "rust-analyzer.procMacro.enable": true,
   "rust-analyzer.check.command": "clippy",
-  "rust-analyzer.cargo.allTargets": false
+  "rust-analyzer.cargo.allTargets": false,
+  "cmake.sourceDirectory": "F:/Programming/input-overlay/ws-server/rmlui-bridge"
 }

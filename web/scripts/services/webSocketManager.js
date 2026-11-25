@@ -253,6 +253,7 @@ export class WebSocketManager {
 
         if (event_type === "mouse_wheel") {
             this.visualizer.noteScroll(event.rotation ?? 1);
+            this.visualizer.pulseWheelKeys(event.rotation ?? 1);
             if (this.visualizer.previewElements?.scrollDisplay)
                 this.visualizer.handleScroll(event.rotation ?? 1);
             return;
@@ -278,6 +279,7 @@ export class WebSocketManager {
     clearStuckKeys() {
         const viz = this.visualizer;
         viz.releaseHeldInputs();
+        viz.clearWheelKeys();
         if (!viz.previewElements) return;
 
         const clearMap = (map) => {
@@ -330,6 +332,8 @@ export class WebSocketManager {
         viz.analogCurrentDepths = {};
 
         viz.mousePadTrail = [];
+        viz._mousePadGhosts = [];
+        viz._mousePadLastActive = -Infinity;
         viz.mousePadCursorX = null;
         viz.mousePadCursorY = null;
         viz.MOUSEPAD_PAN_X = 0;

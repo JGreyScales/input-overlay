@@ -44,6 +44,7 @@ pub struct MousePadConfig {
     pub texture_url: String,
     pub texture_zoom: f32,
     pub texture_opacity: f32,
+    pub reset_delay_ms: f32,
 }
 
 struct TrailPoint {
@@ -91,6 +92,11 @@ pub struct MousePadState {
     last_bg_update: Option<Instant>,
     content_cache: Option<ContentCache>,
     content_dirty: bool,
+    reset_delay: Option<Duration>,
+    last_active: Option<Instant>,
+    burst_start: Option<Instant>,
+    burst: (f32, f32),
+    ghosts: Vec<VecDeque<Option<TrailPoint>>>,
 }
 
 impl MousePadState {
@@ -142,6 +148,12 @@ impl MousePadState {
             last_bg_update: None,
             content_cache: None,
             content_dirty: true,
+            reset_delay: (config.reset_delay_ms > 0.0)
+                .then(|| Duration::from_secs_f32(config.reset_delay_ms / 1000.0)),
+            last_active: None,
+            burst_start: None,
+            burst: (0.0, 0.0),
+            ghosts: Vec::new(),
         }
     }
 
@@ -158,10 +170,74 @@ impl MousePadState {
         max_trail_length: f32,
         m1_active: bool,
     ) {
+        self.handle_move_at(dx, dy, sensitivity, max_trail_length, m1_active, Instant::now());
+    }
+
+    //idle reset for wrap mode: once the mouse has been still for the reset delay the next stroke starts from the middle again
+    //gives back the movement to apply, or None while its only the stray counts of a resting hand
+    fn idle_gate(&mut self, dx: f32, dy: f32, now: Instant) -> Option<(f32, f32)> {
+        let delay = match self.reset_delay {
+            Some(delay) if self.mode == PadMode::Wrap => delay,
+            _ => return Some((dx, dy)),
+        };
+
+        if self.burst_start.is_none_or(|t| now.saturating_duration_since(t) > delay) {
+            self.burst_start = Some(now);
+            self.burst = (0.0, 0.0);
+        }
+        //net travel in this window.. jitter cancels itself out, real movement adds up
+        self.burst.0 += dx;
+        self.burst.1 += dy;
+
+        let idle = self.last_active.is_none_or(|t| now.saturating_duration_since(t) >= delay);
+        //about a quarter of a millimeter at the configured dpi
+        let noise = (self.dpi * 0.01).max(3.0);
+        if self.burst.0.abs() + self.burst.1.abs() < noise {
+            return (!idle).then_some((dx, dy));
+        }
+
+        self.last_active = Some(now);
+        if !idle {
+            return Some((dx, dy));
+        }
+
+        //the old stroke stays where it ended and fades out on its own, the new one starts in the middle
+        let old = std::mem::take(&mut self.trail);
+        if !old.is_empty() {
+            self.ghosts.push(old);
+        }
+        self.cursor_x = self.local_w / 2.0;
+        self.cursor_y = self.local_h / 2.0;
+        self.pending_recenter = false;
+        self.trail.push_back(Some(TrailPoint {
+            x: self.cursor_x,
+            y: self.cursor_y,
+            dx: 0.0,
+            dy: 0.0,
+            t: now,
+            m1: false,
+            d: 0.0,
+        }));
+        Some(self.burst)
+    }
+
+    fn handle_move_at(
+        &mut self,
+        dx: f32,
+        dy: f32,
+        sensitivity: f32,
+        max_trail_length: f32,
+        m1_active: bool,
+        now: Instant,
+    ) {
         let (w, h) = (self.local_w, self.local_h);
         if w <= 0.0 || h <= 0.0 {
             return;
         }
+
+        let Some((dx, dy)) = self.idle_gate(dx, dy, now) else {
+            return;
+        };
 
         if self.pending_recenter {
             self.cursor_x = w / 2.0;
@@ -173,7 +249,6 @@ impl MousePadState {
         let scale = ((w * h) / (300.0 * 200.0)).sqrt();
         let base_sensitivity = 0.05 * sensitivity;
         let m1 = self.m1_highlight && m1_active;
-        let now = Instant::now();
 
         self.total_distance_px += (dx * dx + dy * dy).sqrt();//overlayVisualiser.js:1013 & 1030
 
@@ -284,8 +359,26 @@ impl MousePadState {
         }
     }
 
+    //strokes parked by an idle reset: drop what has faded out, all of them when the trail never fades
+    fn prune_ghosts(&mut self, max_age_ms: f32) {
+        if max_age_ms <= 0.0 {
+            self.ghosts.clear();
+            return;
+        }
+        let expired = |p: &TrailPoint| p.t.elapsed().as_secs_f32() * 1000.0 >= max_age_ms;
+        for ghost in &mut self.ghosts {
+            while ghost.front().is_some_and(|p| p.as_ref().is_none_or(expired)) {
+                ghost.pop_front();
+            }
+        }
+        self.ghosts.retain(|ghost| !ghost.is_empty());
+    }
+
     // !!! bimportant overlayVisualiser.js:1323-1324
     fn trail_is_live(&self, max_age_ms: f32) -> bool {
+        if !self.ghosts.is_empty() {
+            return true;
+        }
         if self.trail.is_empty() {
             return false;
         }
@@ -371,6 +464,7 @@ impl MousePadState {
         let max_age_ms = params.max_age_ms;
 
         self.prune_by_age(max_age_ms);
+        self.prune_ghosts(max_age_ms);
 
         if !self.trail.is_empty() && self.trail.iter().all(|p| p.is_none()) {
             self.trail.clear();
@@ -419,13 +513,14 @@ impl MousePadState {
             });
         
         if !reuse {
+            let rendered_at = Instant::now();
             let Some(content) = self.render_content(buf_w, buf_h, scale, params, idle_fade) else {
                 return;
             };
             
             self.content_cache = Some(ContentCache {
                 pixmap: content,
-                rendered_at: Instant::now(),
+                rendered_at,
                 had_trail: trail_live,
             });
             
@@ -514,48 +609,31 @@ impl MousePadState {
                 }
             }
             PadMode::Wrap => {
-                let mut run: Vec<((f32, f32), bool)> = Vec::new();
-                for point in &self.trail {
-                    match point {
-                        None => {
-                            //overlayVisualiser.js:1337
-                            if run.len() > 1 {
-                                draw_smoothed_run(
-                                    &mut content,
-                                    &run,
-                                    idle_fade,
-                                    active_color,
-                                    font_color,
-                                    trail_width,
-                                    false,
-                                );
-                            }
-                            run.clear();
-                        }
-                        Some(p) => run.push((to_local(p, 0.0, 0.0), p.m1)),
-                    }
-                }
-                if run.len() == 1 {
-                    draw_tip(
+                //strokes left behind by an idle reset keep fading where they ended
+                for ghost in &self.ghosts {
+                    let Some(last) = ghost.iter().rev().find_map(|p| p.as_ref()) else {
+                        continue;
+                    };
+                    let age_ms = last.t.elapsed().as_secs_f32() * 1000.0;
+                    draw_wrap_points(
                         &mut content,
-                        run[0].0,
-                        idle_fade,
-                        run[0].1,
+                        ghost.iter(),
+                        scale,
+                        (1.0 - age_ms / params.max_age_ms).max(0.0),
                         active_color,
                         font_color,
                         trail_width,
                     );
-                } else if run.len() > 1 {
-                    draw_smoothed_run(
-                        &mut content,
-                        &run,
-                        idle_fade,
-                        active_color,
-                        font_color,
-                        trail_width,
-                        true,
-                    );
                 }
+                draw_wrap_points(
+                    &mut content,
+                    self.trail.iter(),
+                    scale,
+                    idle_fade,
+                    active_color,
+                    font_color,
+                    trail_width,
+                );
             }
         }
 
@@ -635,6 +713,36 @@ impl MousePadState {
         draw_text_right_aligned_bottom(
             content, &dist_str, right_x, bottom_y, font_size, color, &font, None,
         );
+    }
+}
+
+//a wrap mode trail, None marks where the cursor wrapped around an edge
+fn draw_wrap_points<'a>(
+    content: &mut Pixmap,
+    points: impl Iterator<Item = &'a Option<TrailPoint>>,
+    scale: f32,
+    fade: f32,
+    active_color: Color,
+    font_color: Color,
+    trail_width: f32,
+) {
+    let mut run: Vec<((f32, f32), bool)> = Vec::new();
+    for point in points {
+        match point {
+            None => {
+                //overlayVisualiser.js:1337
+                if run.len() > 1 {
+                    draw_smoothed_run(content, &run, fade, active_color, font_color, trail_width, false);
+                }
+                run.clear();
+            }
+            Some(p) => run.push(((p.x * scale, p.y * scale), p.m1)),
+        }
+    }
+    if run.len() == 1 {
+        draw_tip(content, run[0].0, fade, run[0].1, active_color, font_color, trail_width);
+    } else if run.len() > 1 {
+        draw_smoothed_run(content, &run, fade, active_color, font_color, trail_width, true);
     }
 }
 
@@ -927,4 +1035,133 @@ fn with_alpha(color: Color, alpha: f32) -> Color {
         c.blue(),
         (alpha.clamp(0.0, 1.0) * 255.0) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: f32 = 250.0;
+    const H: f32 = 180.0;
+
+    fn pad(mode: PadMode, reset_delay_ms: f32) -> MousePadState {
+        let config = MousePadConfig {
+            mode,
+            m1_highlight: false,
+            show_distance: false,
+            dpi: 400.0,
+            reset_distance_after_fade: false,
+            texture_url: String::new(),
+            texture_zoom: 1.0,
+            texture_opacity: 1.0,
+            reset_delay_ms,
+        };
+        MousePadState::new(W, H, &config, Color::WHITE)
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    //mouse moves 8ms apart starting at `from`, gives back the time after the last one
+    fn stroke(pad: &mut MousePadState, dx: f32, dy: f32, from: Instant, events: u32) -> Instant {
+        let mut t = from;
+        for _ in 0..events {
+            pad.handle_move_at(dx, dy, 1.0, 150.0, false, t);
+            t += ms(8);
+        }
+        t
+    }
+
+    fn points(pad: &MousePadState) -> usize {
+        pad.trail.iter().flatten().count()
+    }
+
+    #[test]
+    fn next_stroke_starts_in_the_middle_after_a_pause() {
+        let mut pad = pad(PadMode::Wrap, 200.0);
+        let end = stroke(&mut pad, 12.0, 0.0, Instant::now(), 30);
+        let moved_to = pad.cursor_x;
+        assert!(moved_to > W / 2.0 + 5.0, "cursor only got to {moved_to}");
+
+        //a pause shorter than the delay carries on from where it was
+        let end = stroke(&mut pad, 12.0, 0.0, end + ms(100), 5);
+        assert!(pad.cursor_x > moved_to);
+        assert!(pad.ghosts.is_empty());
+        let moved_to = pad.cursor_x;
+
+        //a longer one parks the old stroke and starts the next from the middle
+        stroke(&mut pad, 0.0, 12.0, end + ms(300), 5);
+        assert_eq!(pad.cursor_x, W / 2.0);
+        assert!(pad.cursor_y > H / 2.0);
+        assert_eq!(pad.ghosts.len(), 1);
+        let parked = pad.ghosts[0].iter().flatten().last().unwrap();
+        assert_eq!(parked.x, moved_to);
+        let first = pad.trail.iter().flatten().next().unwrap();
+        assert_eq!((first.x, first.y), (W / 2.0, H / 2.0));
+    }
+
+    #[test]
+    fn resting_hand_jitter_is_not_movement() {
+        let mut pad = pad(PadMode::Wrap, 200.0);
+        let end = stroke(&mut pad, 12.0, 0.0, Instant::now(), 30);
+
+        //single counts back and forth for two seconds
+        let mut t = end + ms(300);
+        let (before, at) = (points(&pad), pad.cursor_x);
+        for i in 0..40 {
+            pad.handle_move_at(if i % 2 == 0 { 1.0 } else { -1.0 }, 0.0, 1.0, 150.0, false, t);
+            t += ms(50);
+        }
+        assert_eq!(points(&pad), before, "jitter added trail points, the old stroke would never fade");
+        assert_eq!(pad.cursor_x, at);
+        assert!(pad.ghosts.is_empty());
+
+        //real movement after it still starts from the middle
+        stroke(&mut pad, 0.0, 12.0, t, 3);
+        assert_eq!(pad.cursor_x, W / 2.0);
+        assert_eq!(pad.ghosts.len(), 1);
+    }
+
+    #[test]
+    fn slow_steady_movement_is_not_swallowed() {
+        let mut pad = pad(PadMode::Wrap, 200.0);
+        //one count every 8ms in the same direction
+        stroke(&mut pad, 1.0, 0.0, Instant::now(), 100);
+        assert!(pad.cursor_x > W / 2.0 + 3.0, "cursor only got to {}", pad.cursor_x);
+        assert!(pad.ghosts.is_empty());
+    }
+
+    #[test]
+    fn a_delay_of_zero_keeps_the_old_behaviour() {
+        let mut pad = pad(PadMode::Wrap, 0.0);
+        let end = stroke(&mut pad, 12.0, 0.0, Instant::now(), 30);
+        let moved_to = pad.cursor_x;
+        stroke(&mut pad, 12.0, 0.0, end + ms(300), 5);
+        assert!(pad.cursor_x > moved_to);
+        assert!(pad.ghosts.is_empty());
+    }
+
+    #[test]
+    fn pan_mode_is_left_alone() {
+        let mut pad = pad(PadMode::Pan, 200.0);
+        let end = stroke(&mut pad, 12.0, 0.0, Instant::now(), 30);
+        let before = points(&pad);
+        stroke(&mut pad, 12.0, 0.0, end + ms(300), 5);
+        assert_eq!(points(&pad), before + 5);
+        assert!(pad.ghosts.is_empty());
+    }
+
+    #[test]
+    fn parked_strokes_keep_the_pad_redrawing_until_they_are_gone() {
+        let mut pad = pad(PadMode::Wrap, 200.0);
+        let end = stroke(&mut pad, 12.0, 0.0, Instant::now(), 30);
+        stroke(&mut pad, 0.0, 12.0, end + ms(300), 5);
+        assert_eq!(pad.ghosts.len(), 1);
+        assert!(pad.trail_is_live(600.0));
+
+        //with fading turned off there is nothing to fade, they just go
+        pad.prune_ghosts(0.0);
+        assert!(pad.ghosts.is_empty());
+    }
 }
