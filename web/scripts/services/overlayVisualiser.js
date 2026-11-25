@@ -28,6 +28,10 @@ export class OverlayVisualiser {
 
         this.mousePadCanvas = null;
         this.mousePadCtx = null;
+        this.mousePadBgCanvas = null;
+        this.mousePadBgCtx = null;
+        this._mousePadBgKey = null;
+        this._mousePadBgSrc = null;
         this.mousePadTrail = [];
         this.mousePadCursorX = null;
         this.mousePadCursorY = null;
@@ -346,6 +350,8 @@ export class OverlayVisualiser {
                         this._mousePadTextureImg = img;
                         this._mousePadTexturePattern = null;
                         this._mousePadTextureTintCanvas = null;
+                        //paint it now: the frame requested below gets cancelled if the connection (re)opens in the meantime
+                        this._mousePadRefreshBackground();
                         if (!this.mousePadRafId && this.mousePadCtx)
                             this.mousePadRafId = requestAnimationFrame(this._mousePadRafLoop);
                     };
@@ -770,6 +776,12 @@ export class OverlayVisualiser {
         wrap.style.setProperty("--key-width", `${widthPx}px`);
         wrap.style.setProperty("--key-height-modifier", heightMod);
 
+        //the texture / pan checkerboard gets its own canvas underneath, so the trail canvas is the only one redrawn per frame
+        const bgCanvas = document.createElement("canvas");
+        bgCanvas.className = "mousepad-bg-canvas";
+        bgCanvas.style.cssText = "display:block;position:absolute;inset:0;width:100%;height:100%;pointer-events:none;";
+        wrap.appendChild(bgCanvas);
+
         const canvas = document.createElement("canvas");
         canvas.className = "mousepad-canvas";
         canvas.id = "mouse_pad";
@@ -778,6 +790,10 @@ export class OverlayVisualiser {
 
         this.mousePadCanvas = canvas;
         this.mousePadCtx = canvas.getContext("2d");
+        this.mousePadBgCanvas = bgCanvas;
+        this.mousePadBgCtx = bgCanvas.getContext("2d");
+        this._mousePadBgKey = null;
+        this._mousePadBgSrc = null;
         this.mousePadTrail = [];
         this._mousePadGhosts = [];
         this.mousePadCursorX = null;
@@ -1140,13 +1156,19 @@ export class OverlayVisualiser {
         const logicalH = parseFloat(wrap.style.height) || wrap.offsetHeight;
         if (!logicalW || !logicalH) return;
         const dpr = (window.devicePixelRatio || 1) * 3;
-        this.mousePadCanvas.width = Math.round(logicalW * dpr);
-        this.mousePadCanvas.height = Math.round(logicalH * dpr);
-        this.mousePadCanvas.style.width = `${logicalW}px`;
-        this.mousePadCanvas.style.height = `${logicalH}px`;
+        for (const [canvas, ctx] of [[this.mousePadCanvas, this.mousePadCtx], [this.mousePadBgCanvas, this.mousePadBgCtx]]) {
+            if (!canvas || !ctx) continue;
+            canvas.width = Math.round(logicalW * dpr);
+            canvas.height = Math.round(logicalH * dpr);
+            canvas.style.width = `${logicalW}px`;
+            canvas.style.height = `${logicalH}px`;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
         this.mousePadCanvas.dataset.logicalW = logicalW;
         this.mousePadCanvas.dataset.logicalH = logicalH;
-        this.mousePadCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        //sizing a canvas wipes it, so put the background straight back instead of leaving the pad empty until the mouse moves
+        this._mousePadBgKey = null;
+        this._mousePadPaintBackground(logicalW, logicalH);
         this.mousePadCursorX = logicalW / 2;
         this.mousePadCursorY = logicalH / 2;
         this.mousePadTrail = [];
@@ -1291,6 +1313,137 @@ export class OverlayVisualiser {
         }).catch(() => {});
     }
 
+    //brings the background up to date outside of the trail's frame loop
+    _mousePadRefreshBackground() {
+        if (!this.mousePadCanvas) return;
+        const W = parseFloat(this.mousePadCanvas.dataset.logicalW);
+        const H = parseFloat(this.mousePadCanvas.dataset.logicalH);
+        if (W && H) this._mousePadPaintBackground(W, H);
+    }
+
+    //paints the pad background (texture, or the checkerboard of pan mode) onto its own canvas below the trail.
+    //called every frame but only repaints when something the background depends on has changed, so a still image is drawn once
+    //instead of once per frame. animated textures and a panning background still repaint as they move
+    _mousePadPaintBackground(W, H) {
+        const ctx = this.mousePadBgCtx;
+        if (!ctx) return;
+
+        const pan = this.MOUSEPAD_MODE === "pan";
+        const src = this._mousePadVideoEl || this._mousePadGifFrame || this._mousePadTextureImg || null;
+        const [r, g, b] = this._activeColorRGB || [139, 92, 246];
+        const tintColor = `rgba(${r},${g},${b},0.13)`;
+        const key = (src || pan)
+            ? `${W}|${H}|${pan ? `${this.MOUSEPAD_PAN_X || 0},${this.MOUSEPAD_PAN_Y || 0}` : "wrap"}|${tintColor}|${this.MOUSEPAD_TEXTURE_ZOOM || 1}|${this.MOUSEPAD_TEXTURE_OPACITY ?? 1}|${window.devicePixelRatio || 1}`
+            : "";
+        if (!this._mousePadTextureAnimated && key === this._mousePadBgKey && src === this._mousePadBgSrc) return;
+        this._mousePadBgKey = key;
+        this._mousePadBgSrc = src;
+
+        ctx.clearRect(0, 0, W, H);
+        if (!src && !pan) return;
+
+        let texSrc = null;
+        let tw = 0, th = 0;
+        if (this._mousePadVideoEl) {
+            texSrc = this._mousePadVideoEl;
+            tw = this._mousePadVideoEl.videoWidth;
+            th = this._mousePadVideoEl.videoHeight;
+        } else if (this._mousePadGifFrame) {
+            texSrc = this._mousePadGifFrame;
+            tw = texSrc.displayWidth || texSrc.codedWidth;
+            th = texSrc.displayHeight || texSrc.codedHeight;
+        } else if (this._mousePadTextureImg) {
+            texSrc = this._mousePadTextureImg;
+            tw = texSrc.naturalWidth || texSrc.width;
+            th = texSrc.naturalHeight || texSrc.height;
+        }
+
+        if (texSrc && tw > 0 && th > 0) {
+            const zoom = this.MOUSEPAD_TEXTURE_ZOOM || 1;
+            const dpr = (window.devicePixelRatio || 1) * 2;
+            const neededW = Math.round(tw * zoom * dpr);
+            const neededH = Math.round(th * zoom * dpr);
+
+            const needRebuild = this._mousePadTextureAnimated ||
+                !this._mousePadTextureTintCanvas ||
+                this._mousePadTextureTintCanvas.width !== neededW ||
+                this._mousePadTextureTintCanvas.height !== neededH ||
+                this._mousePadTextureTintCanvas._tintColor !== tintColor ||
+                this._mousePadTextureTintCanvas._zoom !== zoom ||
+                this._mousePadTextureTintCanvas._dpr !== dpr;
+
+            if (needRebuild) {
+                let tc = this._mousePadTextureTintCanvas;
+                if (!tc || tc.width !== neededW || tc.height !== neededH) {
+                    tc = document.createElement("canvas");
+                    tc.width = neededW;
+                    tc.height = neededH;
+                    this._mousePadTextureTintCanvas = tc;
+                    this._mousePadTexturePattern = null;
+                }
+                const tc2d = tc.getContext("2d");
+                tc2d.globalCompositeOperation = "source-over";
+                tc2d.clearRect(0, 0, neededW, neededH);
+                tc2d.drawImage(texSrc, 0, 0, neededW, neededH);
+                tc2d.globalCompositeOperation = "multiply";
+                tc2d.fillStyle = tintColor;
+                tc2d.fillRect(0, 0, neededW, neededH);
+                tc2d.globalCompositeOperation = "destination-in";
+                tc2d.drawImage(texSrc, 0, 0, neededW, neededH);
+                tc2d.globalCompositeOperation = "source-over";
+                tc._tintColor = tintColor;
+                tc._zoom = zoom;
+                tc._dpr = dpr;
+                if (!this._mousePadTextureAnimated)
+                    this._mousePadTexturePattern = ctx.createPattern(tc, "repeat");
+            }
+
+            const tc = this._mousePadTextureTintCanvas;
+            const tcDpr = tc._dpr || 1;
+            const tilW = tc.width / tcDpr;
+            const tilH = tc.height / tcDpr;
+            const panX = this.MOUSEPAD_MODE === "pan" ? (this.MOUSEPAD_PAN_X || 0) : 0;
+            const panY = this.MOUSEPAD_MODE === "pan" ? (this.MOUSEPAD_PAN_Y || 0) : 0;
+            const centerOffX = W / 2 - tilW / 2;
+            const centerOffY = H / 2 - tilH / 2;
+            const rawX = centerOffX + panX;
+            const rawY = centerOffY + panY;
+            const wrapX = ((rawX % tilW) + tilW) % tilW;
+            const wrapY = ((rawY % tilH) + tilH) % tilH;
+
+            const opacity = this.MOUSEPAD_TEXTURE_OPACITY ?? 1;
+            if (opacity !== 1) ctx.globalAlpha = opacity;
+            if (this._mousePadTextureAnimated) {
+                const startX = wrapX - tilW;
+                const startY = wrapY - tilH;
+                for (let y = startY; y < H; y += tilH)
+                    for (let x = startX; x < W; x += tilW)
+                        ctx.drawImage(tc, x, y, tilW, tilH);
+            } else if (this._mousePadTexturePattern) {
+                const mat = new DOMMatrix().scale(1 / tcDpr).translate(wrapX * tcDpr, wrapY * tcDpr);
+                this._mousePadTexturePattern.setTransform(mat);
+                ctx.fillStyle = this._mousePadTexturePattern;
+                ctx.fillRect(0, 0, W, H);
+            }
+            if (opacity !== 1) ctx.globalAlpha = 1;
+        } else if (this.MOUSEPAD_MODE === "pan") {
+            const SZ = 12;
+            const panX = ((this.MOUSEPAD_PAN_X || 0) % (SZ * 2) + SZ * 2) % (SZ * 2);
+            const panY = ((this.MOUSEPAD_PAN_Y || 0) % (SZ * 2) + SZ * 2) % (SZ * 2);
+            for (let row = -1; row < Math.ceil(H / SZ) + 1; row++) {
+                for (let col = -1; col < Math.ceil(W / SZ) + 1; col++) {
+                    if ((row + col) % 2 === 0) continue;
+                    ctx.fillStyle = tintColor;
+                    ctx.fillRect(
+                        Math.floor(col * SZ + panX - SZ),
+                        Math.floor(row * SZ + panY - SZ),
+                        SZ, SZ
+                    );
+                }
+            }
+        }
+    }
+
     _mousePadRafLoop() {
         this.mousePadRafId = null;
         if (!this.mousePadCtx || !this.mousePadCanvas) return;
@@ -1303,112 +1456,8 @@ export class OverlayVisualiser {
         const maxAge = this.MOUSEPAD_TRAIL_MS;
 
         ctx.clearRect(0, 0, W, H);
+        this._mousePadPaintBackground(W, H);
 
-        if (this._mousePadTextureImg || this._mousePadVideoEl || this._mousePadGifFrame || this.MOUSEPAD_MODE === "pan") {
-            const [r, g, b] = this._activeColorRGB || [139, 92, 246];
-            const tintColor = `rgba(${r},${g},${b},0.13)`;
-
-            let texSrc = null;
-            let tw = 0, th = 0;
-            if (this._mousePadVideoEl) {
-                texSrc = this._mousePadVideoEl;
-                tw = this._mousePadVideoEl.videoWidth;
-                th = this._mousePadVideoEl.videoHeight;
-            } else if (this._mousePadGifFrame) {
-                texSrc = this._mousePadGifFrame;
-                tw = texSrc.displayWidth || texSrc.codedWidth;
-                th = texSrc.displayHeight || texSrc.codedHeight;
-            } else if (this._mousePadTextureImg) {
-                texSrc = this._mousePadTextureImg;
-                tw = texSrc.naturalWidth || texSrc.width;
-                th = texSrc.naturalHeight || texSrc.height;
-            }
-
-            if (texSrc && tw > 0 && th > 0) {
-                const zoom = this.MOUSEPAD_TEXTURE_ZOOM || 1;
-                const dpr = (window.devicePixelRatio || 1) * 2;
-                const neededW = Math.round(tw * zoom * dpr);
-                const neededH = Math.round(th * zoom * dpr);
-
-                const needRebuild = this._mousePadTextureAnimated ||
-                    !this._mousePadTextureTintCanvas ||
-                    this._mousePadTextureTintCanvas.width !== neededW ||
-                    this._mousePadTextureTintCanvas.height !== neededH ||
-                    this._mousePadTextureTintCanvas._tintColor !== tintColor ||
-                    this._mousePadTextureTintCanvas._zoom !== zoom ||
-                    this._mousePadTextureTintCanvas._dpr !== dpr;
-
-                if (needRebuild) {
-                    let tc = this._mousePadTextureTintCanvas;
-                    if (!tc || tc.width !== neededW || tc.height !== neededH) {
-                        tc = document.createElement("canvas");
-                        tc.width = neededW;
-                        tc.height = neededH;
-                        this._mousePadTextureTintCanvas = tc;
-                        this._mousePadTexturePattern = null;
-                    }
-                    const tc2d = tc.getContext("2d");
-                    tc2d.globalCompositeOperation = "source-over";
-                    tc2d.clearRect(0, 0, neededW, neededH);
-                    tc2d.drawImage(texSrc, 0, 0, neededW, neededH);
-                    tc2d.globalCompositeOperation = "multiply";
-                    tc2d.fillStyle = tintColor;
-                    tc2d.fillRect(0, 0, neededW, neededH);
-                    tc2d.globalCompositeOperation = "destination-in";
-                    tc2d.drawImage(texSrc, 0, 0, neededW, neededH);
-                    tc2d.globalCompositeOperation = "source-over";
-                    tc._tintColor = tintColor;
-                    tc._zoom = zoom;
-                    tc._dpr = dpr;
-                    if (!this._mousePadTextureAnimated)
-                        this._mousePadTexturePattern = ctx.createPattern(tc, "repeat");
-                }
-
-                const tc = this._mousePadTextureTintCanvas;
-                const tcDpr = tc._dpr || 1;
-                const tilW = tc.width / tcDpr;
-                const tilH = tc.height / tcDpr;
-                const panX = this.MOUSEPAD_MODE === "pan" ? (this.MOUSEPAD_PAN_X || 0) : 0;
-                const panY = this.MOUSEPAD_MODE === "pan" ? (this.MOUSEPAD_PAN_Y || 0) : 0;
-                const centerOffX = W / 2 - tilW / 2;
-                const centerOffY = H / 2 - tilH / 2;
-                const rawX = centerOffX + panX;
-                const rawY = centerOffY + panY;
-                const wrapX = ((rawX % tilW) + tilW) % tilW;
-                const wrapY = ((rawY % tilH) + tilH) % tilH;
-
-                const opacity = this.MOUSEPAD_TEXTURE_OPACITY ?? 1;
-                if (opacity !== 1) ctx.globalAlpha = opacity;
-                if (this._mousePadTextureAnimated) {
-                    const startX = wrapX - tilW;
-                    const startY = wrapY - tilH;
-                    for (let y = startY; y < H; y += tilH)
-                        for (let x = startX; x < W; x += tilW)
-                            ctx.drawImage(tc, x, y, tilW, tilH);
-                } else if (this._mousePadTexturePattern) {
-                    const mat = new DOMMatrix().scale(1 / tcDpr).translate(wrapX * tcDpr, wrapY * tcDpr);
-                    this._mousePadTexturePattern.setTransform(mat);
-                    ctx.fillStyle = this._mousePadTexturePattern;
-                    ctx.fillRect(0, 0, W, H);
-                }
-                if (opacity !== 1) ctx.globalAlpha = 1;
-            } else if (this.MOUSEPAD_MODE === "pan") {
-                const SZ = 12;
-                const panX = ((this.MOUSEPAD_PAN_X || 0) % (SZ * 2) + SZ * 2) % (SZ * 2);
-                const panY = ((this.MOUSEPAD_PAN_Y || 0) % (SZ * 2) + SZ * 2) % (SZ * 2);
-                for (let row = -1; row < Math.ceil(H / SZ) + 1; row++) {
-                    for (let col = -1; col < Math.ceil(W / SZ) + 1; col++) {
-                        if ((row + col) % 2 === 0) continue;
-                        ctx.fillStyle = tintColor;
-                        ctx.fillRect(
-                            Math.floor(col * SZ + panX - SZ),
-                            Math.floor(row * SZ + panY - SZ),
-                            SZ, SZ
-                        );
-                    }
-                }
-            }
-        }
         if (this.mousePadTrail.length > 0 && maxAge > 0) {
             const cutoff = now - maxAge;
             let firstValid = 0;

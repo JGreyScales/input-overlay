@@ -143,6 +143,7 @@ impl SettingsView {
             linux_raw_mouse_device: self.original.linux_raw_mouse_device.clone(),
             dismissed_update_versions: self.original.dismissed_update_versions.clone(),
             theme: Some(if app.dark_theme() { "dark" } else { "light" }.into()),
+            config_version: self.original.config_version,
         }
     }
 

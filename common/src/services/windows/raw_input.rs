@@ -8,11 +8,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, SetThreadPriorityBoost, THREAD_PRIORITY_BELOW_NORMAL,
-};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     LoadKeyboardLayoutW, MapVirtualKeyExW, MAPVK_VSC_TO_VK_EX,
 };
@@ -158,10 +155,8 @@ fn run_raw_input(
     flush_handle_out: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 ) {
     unsafe {
-        if system_tweaks {
-            set_background_priority();
-        }
-
+        //this thread stays at normal priority. it used to drop itself below normal and switch off the wake-up boost,
+        //so with a game keeping the cores busy windows could leave input sitting in the buffer for whole frames
         let hwnd = match create_message_window() {
             Some(h) => h,
             None => {
@@ -251,12 +246,6 @@ fn run_raw_input(
             }
         }
     }
-}
-
-unsafe fn set_background_priority() {
-    let h = GetCurrentThread();
-    let _ = SetThreadPriority(h, THREAD_PRIORITY_BELOW_NORMAL);
-    let _ = SetThreadPriorityBoost(h, BOOL(1));
 }
 
 unsafe fn create_message_window() -> Option<HWND> {
